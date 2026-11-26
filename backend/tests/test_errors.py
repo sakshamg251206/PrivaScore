@@ -111,3 +111,66 @@ def test_an_unexpected_exception_is_a_generic_500(client_no_reraise, policy_text
 def test_every_error_body_has_the_same_shape(client):
     r = client.post("/api/v1/evaluate", json={"text": "tiny"})
     assert set(r.json()["error"]) >= {"code", "message", "retry_after_s"}
+
+
+# --- the fallback model (settings.llm_fallback_model)
+#
+# The provider's daily cap is per model, so when the primary model is spent a different one may
+# still answer. Accuracy differs between models, so the one that actually answered must be named
+# in the response; a silent swap would misreport how the result was produced.
+
+def _fallback_client(client_factory, **overrides):
+    return client_factory(llm_provider="mock", bert="off", bert_required=False,
+                          rate_limit_per_client=0, **overrides)
+
+
+def test_fallback_answers_when_the_primary_model_is_out_of_quota(client_factory, policy_text):
+    with _fallback_client(client_factory, llm_fallback_model="fallback-model") as c:
+        pipeline = c.app.state.pipeline
+        pipeline.client.complete_json = _raise(QuotaExhausted("mock: daily quota reached"))
+        r = c.post("/api/v1/evaluate", json={"text": policy_text})
+    assert r.status_code == 200
+    # The fallback's own client answered, so the response must name IT, not the primary model.
+    assert r.json()["meta"]["model"] == "fallback-model"
+
+
+def test_no_fallback_configured_still_fails_with_the_quota_error(client_factory, policy_text):
+    """The fallback is opt-in: without one the behaviour is exactly as before."""
+    with _fallback_client(client_factory) as c:
+        c.app.state.pipeline.client.complete_json = _raise(QuotaExhausted("mock: daily quota reached"))
+        r = c.post("/api/v1/evaluate", json={"text": policy_text})
+    assert r.status_code == 429
+    assert r.json()["error"]["code"] == "LLM_QUOTA"
+
+
+def test_both_models_failing_reports_every_call_that_was_billed(client_factory, policy_text):
+    """The route refunds the budget only when NOTHING was billed. If the primary model billed a
+    call before running out, a refund would hand back budget that was really spent, so the count
+    on the escaping error has to cover both attempts."""
+    with _fallback_client(client_factory, llm_fallback_model="fallback-model") as c:
+        pipeline = c.app.state.pipeline
+        real_extract = pipeline._extract
+
+        def extract(text, scope, company_name, client=None):
+            exc = QuotaExhausted("mock: daily quota reached")
+            exc.completed_llm_calls = 1          # each attempt billed one call before failing
+            raise exc
+
+        pipeline._extract = extract
+        seen = {}
+        from app.routers import evaluate as ev
+        original = ev._refund_if_nothing_was_billed
+
+        def spy(limiter, who, exc):
+            seen["billed"] = getattr(exc, "completed_llm_calls", None)
+            return original(limiter, who, exc)
+
+        ev._refund_if_nothing_was_billed = spy
+        try:
+            r = c.post("/api/v1/evaluate", json={"text": policy_text})
+        finally:
+            ev._refund_if_nothing_was_billed = original
+            pipeline._extract = real_extract
+
+    assert r.status_code == 429
+    assert seen["billed"] == 2, "both attempts billed a call; a refund here would be wrong"

@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from privascore.config import load_config
 from privascore.extractor import Extractor, load_rules
 from privascore.flags import load_flags
-from privascore.llm import LLMError, make_client
+from privascore.llm import LLMError, QuotaExhausted, make_client
 from privascore.metrics import policy_metrics
 
 from .settings import Settings
@@ -33,6 +33,7 @@ class RawAnalysis:
     metrics: dict         # privascore.metrics.policy_metrics() output
     llm_calls: int
     timings_ms: dict
+    model: str = ""       # which model actually answered; "" means the primary one
 
 
 class PipelineService:
@@ -51,6 +52,8 @@ class PipelineService:
         self.cfg = cfg
         self.provider, self.model = cfg.llm.provider, cfg.llm.model
         self.client = make_client(cfg.llm)       # raises LLMError if the API key is missing
+        self.fallback_model = settings.llm_fallback_model.strip()
+        self._fallback_client = None             # built on first use, not at startup
         self.flagset = load_flags()
         self.rules = load_rules()                # per-flag ED/CD/EE definitions, shown in the UI
         self.bert = None
@@ -75,9 +78,16 @@ class PipelineService:
         m = policy_metrics(text, self.bert)
         return m, round((time.perf_counter() - t) * 1000)
 
-    def _extract(self, text: str, scope: str, company_name: str | None):
+    def _fallback(self):
+        """The fallback client, built on first use. A bad model name must not stop the server
+        booting, and most requests never need it."""
+        if self._fallback_client is None:
+            self._fallback_client = make_client(replace(self.cfg.llm, model=self.fallback_model))
+        return self._fallback_client
+
+    def _extract(self, text: str, scope: str, company_name: str | None, client=None):
         t = time.perf_counter()
-        ex = InMemoryExtractor(self.client, self.flagset, self.cfg.extractor)   # cheap; one per request
+        ex = InMemoryExtractor(client or self.client, self.flagset, self.cfg.extractor)   # cheap; one per request
         try:
             res = ex.extract_policy_batch(text, policy_id="input", scope=scope,
                                           policy_name=(company_name or "").strip().lower())
@@ -94,13 +104,35 @@ class PipelineService:
 
     async def analyse(self, text: str, scope: str, company_name: str | None) -> RawAnalysis:
         t = time.perf_counter()
-        (metrics, m_ms), (extraction, calls, e_ms) = await asyncio.gather(
-            asyncio.to_thread(self._metrics, text),
-            asyncio.to_thread(self._extract, text, scope, company_name),
-        )
+        metrics_task = asyncio.ensure_future(asyncio.to_thread(self._metrics, text))
+        try:
+            try:
+                extraction, calls, e_ms = await asyncio.to_thread(
+                    self._extract, text, scope, company_name)
+                model = self.model
+            except QuotaExhausted as primary:
+                # The provider's cap is per model, so a different model may still have quota.
+                # Only tried when one is configured; otherwise this is the old behaviour.
+                if not self.fallback_model:
+                    raise
+                spent = getattr(primary, "completed_llm_calls", 0)
+                try:
+                    extraction, calls, e_ms = await asyncio.to_thread(
+                        self._extract, text, scope, company_name, self._fallback())
+                except LLMError as second:
+                    # Both failed. The route refunds only when NOTHING was billed, so the
+                    # count has to cover both attempts, not just the second one.
+                    second.completed_llm_calls = spent + getattr(second, "completed_llm_calls", 0)
+                    raise
+                calls += spent
+                model = self.fallback_model
+        except BaseException:
+            metrics_task.cancel()                # nothing will await it otherwise
+            raise
+        metrics, m_ms = await metrics_task
         total = round((time.perf_counter() - t) * 1000)
         return RawAnalysis(extraction, metrics, calls,
-                           {"metrics": m_ms, "extraction": e_ms, "total": total})
+                           {"metrics": m_ms, "extraction": e_ms, "total": total}, model=model)
 
 
 def utf16_offsets(text: str):

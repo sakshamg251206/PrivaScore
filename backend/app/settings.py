@@ -28,6 +28,11 @@ class Settings(BaseSettings):
 
     llm_provider: str = ""          # empty -> whatever privascore.toml says
     llm_model: str = ""
+    # A second model to try once when the primary one has no quota left. Empty disables it.
+    # The provider's daily cap is per model, so a different model has its own allowance.
+    # NOT a free win: gold-set accuracy differs by model (README "Results"), so whatever
+    # answers is named in meta.model and shown in the UI. Never fall back silently.
+    llm_fallback_model: str = ""
 
     bert: Literal["on", "off"] = "on"
     bert_required: bool = True
