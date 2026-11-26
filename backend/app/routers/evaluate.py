@@ -57,7 +57,11 @@ async def evaluate(body: EvaluateRequest, request: Request, response: Response) 
         raise ApiError("LLM_OVERLOADED", 503, retry_after_s=120) from None
     except QuotaExhausted as exc:
         _refund_if_nothing_was_billed(limiter, who, exc)
-        raise ApiError("LLM_QUOTA", 429, retry_after_s=60) from None
+        # No Retry-After: this is reached on a *daily* provider cap (base.py raises it at once on a
+        # "per day" 429), which resets hours away, not in a minute. A short hint here was a wrong
+        # promise -- the provider's own retryDelay has been ~18h. We are not told the real figure
+        # (and must not forward provider text), so we send none rather than invent one.
+        raise ApiError("LLM_QUOTA", 429) from None
     except LLMError:
         # Most LLMErrors are absorbed inside the pipeline (those flags become "rejected" and
         # the result is a 200 with complete=false). Only an escaping one lands here.

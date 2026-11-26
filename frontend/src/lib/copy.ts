@@ -172,7 +172,8 @@ export const copy = {
       CANCELLED: "Something went wrong",
     },
     BUSY: "Another analysis is running. Try again in about a minute.",
-    LLM_QUOTA: "Gemini's usage limit has been reached. Try again later, or open a saved analysis.",
+    LLM_QUOTA:
+      "Gemini's usage limit has been reached. This is a cap on analyses per day, so it may not reset for several hours \u2014 trying again shortly will not help. Open a saved analysis instead: all fifteen still work.",
     LLM_OVERLOADED: "Gemini is overloaded right now. Try again in a few minutes.",
     LLM_ERROR: "The analysis service failed. Nothing was saved. Try again.",
     BODY_TOO_LARGE: (max: string) => `This is over ${max} characters. Paste only the privacy policy.`,

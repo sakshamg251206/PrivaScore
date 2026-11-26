@@ -39,7 +39,7 @@ def test_quota_exhausted_is_429(client, policy_text, break_llm):
     r = _post(client, policy_text)
     assert r.status_code == 429
     assert r.json()["error"]["code"] == "LLM_QUOTA"
-    assert r.headers["retry-after"] == "60"
+    assert "retry-after" not in r.headers        # a daily cap is hours away, so we promise no time
     assert "quota reached" not in r.text          # provider text never reaches the client
 
 
